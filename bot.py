@@ -2,17 +2,18 @@ import asyncio
 import io
 import logging
 import os
+import string
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Union, List, Tuple
-import string
-import random
+from types import coroutine
+from typing import Optional, Union, List, Tuple, Callable
+
 import aiohttp.client_exceptions
 import aiosqlite
 import discord
+import disputils
 import ksoftapi
 from aiosqlite import Connection
-
 from discord.ext import commands
 
 SQL_STRING = """
@@ -48,6 +49,11 @@ class BlackListContext(commands.Context):
     ERROR = 1
     OK = 2
 
+    BAN = "🔨"
+    KICK = "🚪"
+    IGNORE = "🔇"
+    PUBLIC = "📣"
+
     def __init__(self, **kwargs):
         super(BlackListContext, self).__init__(**kwargs)
 
@@ -80,6 +86,98 @@ class BlackListContext(commands.Context):
 
     async def get_color(self, typ: int):
         return [discord.Colour.blue(), discord.Colour.red(), discord.Colour.green()][typ]
+
+    async def confirm(self, message: str, confirmed: str, denied: str):
+        conf = disputils.BotConfirmation(self, color=await self.get_color(self.INFO))
+        await conf.confirm(message)
+        if conf.confirmed:
+            await conf.update(text=confirmed, color=await self.get_color(self.OK))
+        else:
+            await conf.update(text=denied, color=await self.get_color(self.ERROR))
+        return conf.confirmed
+
+    async def confirm_coro(self, message: str, confirmed: str, denied: str, coro: coroutine):
+        conf = disputils.BotConfirmation(self, color=await self.get_color(self.INFO))
+        await conf.confirm(message)
+        if conf.confirmed:
+            await coro
+            await conf.update(text=confirmed, color=await self.get_color(self.OK))
+        else:
+            await conf.update(text=denied, color=await self.get_color(self.ERROR))
+        return conf.confirmed
+
+    async def input(self, typ: type, cancel_str: str = "cancel", ch: Callable = None, err=None, check_author=True,
+                    return_author=False, del_error=60, del_response=False, timeout=60.0):
+        def check(m):
+            return ((m.author == self.author and m.channel == self.channel) or not check_author) and not m.author.bot
+
+        while True:
+            try:
+                inp: discord.Message = await self.bot.wait_for('message', check=check, timeout=timeout)
+                if del_response:
+                    await inp.delete()
+                if inp.content.lower() == cancel_str.lower():
+                    return (None, None) if return_author else None
+                res = typ(inp.content.lower())
+                if ch:
+                    if not ch(res):
+                        raise ValueError
+                return (res, inp.author) if return_author else res
+            except ValueError:
+                await self.send(err or "That's not a valid response, try again" +
+                                ("" if not cancel_str else f" or type `{cancel_str}` to quit"), delete_after=del_error)
+                continue
+            except asyncio.TimeoutError:
+                await self.send("You took too long to respond ): Try to start over", delete_after=del_error)
+                return (None, None) if return_author else None
+
+    # noinspection PyDefaultArgument
+    async def channel_embed(self, *,
+                            channel: Union[int, discord.abc.Messageable],
+                            author: str = None,
+                            description: str = None,
+                            title: str = None,
+                            title_url: str = None,
+                            typ: int = INFO,
+                            fields: List[Tuple[str, str]] = None,
+                            thumbnail: str = None,
+                            clr: discord.Colour = None,
+                            image: Union[str, io.BufferedIOBase] = None,
+                            footer: str = None,
+                            not_inline: List[int] = [],
+                            trash_reaction: bool = False):
+        if isinstance(channel, int):
+            channel = self.bot.get_channel(channel)
+        if typ and clr:
+            raise ValueError("typ and clr can not be both defined")
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            colour=(await self.get_color(typ) if not clr else clr),
+            title_url=title_url
+        )
+        if author:
+            embed.set_author(name=author)
+        if image:
+            if isinstance(image, str):
+                embed.set_image(url=image)
+                f = None
+            else:
+                image.seek(0)
+                f = discord.File(image, filename="image.png")
+                embed.set_image(url="attachment://image.png")
+        else:
+            f = None
+        if footer:
+            embed.set_footer(text=footer)
+        if thumbnail:
+            embed.set_thumbnail(url=thumbnail)
+        for n, r in enumerate(fields or []):
+            embed.add_field(name=r[0], value=r[1] or "None", inline=n not in not_inline)
+        msg = await channel.send(embed=embed, file=f)
+        if trash_reaction:
+            await channel.trash_reaction(msg)
+        return msg
 
     # noinspection PyDefaultArgument
     async def embed(self, *,
@@ -124,6 +222,7 @@ class BlackListContext(commands.Context):
         msg = await self.send(embed=embed, file=f)
         if trash_reaction:
             await self.trash_reaction(msg)
+        return msg
 
     async def trash_reaction(self, message: discord.Message):
         if len(message.embeds) == 0:
@@ -234,12 +333,11 @@ class BlackListBot(commands.Bot):
 
 @dataclass(frozen=True)
 class Report:
-    id: int
+    id: str
     reporter: int
     guild: int
     reported: int
     reason: str
-    images: str
 
 
 class Database:
