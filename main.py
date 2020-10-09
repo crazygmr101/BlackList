@@ -1,8 +1,9 @@
+import logging
 import os
 
 import dotenv
 
-from bot import *
+from bot import BlackListBot
 
 dotenv.load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -11,7 +12,7 @@ bot = BlackListBot(command_prefix="bl!", help_command=None)
 
 extensions = {
     "Hidden": {
-        "cogs.entrance_warning": "EntranceWarning"
+        "cogs.safety": "Safety"
     },
     "Misc": {
         "cogs.help": "Help"

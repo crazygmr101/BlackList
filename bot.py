@@ -1,14 +1,53 @@
 import asyncio
+import io
 import logging
+import os
+from dataclasses import dataclass
 from datetime import datetime
-
+from typing import Optional, Union, List, Tuple
+import string
+import random
 import aiohttp.client_exceptions
 import aiosqlite
 import discord
+import ksoftapi
+from aiosqlite import Connection
+
 from discord.ext import commands
+
+SQL_STRING = """
+CREATE TABLE IF NOT EXISTS "guilds" (
+    "id" INTEGER NOT NULL,
+    "incoming" INTEGER DEFAULT 0,
+    "public" INTEGER DEFAULT 0,
+    "warn_incoming" INTEGER DEFAULT 0
+);;
+CREATE TABLE IF NOT EXISTS "reports" (
+    "id" TEXT NOT NULL,
+    "reporter" INTEGER NOT NULL,
+    "guild" INTEGER NOT NULL,
+    "reported" INTEGER NOT NULL,
+    "reason" TEXT NOT NULL
+);;
+CREATE TABLE IF NOT EXISTS "messages" (
+    "guild" INTEGER NOT NULL,
+    "message" INTEGER NOT NULL,
+    "report" TEXT NOT NULL,
+    FOREIGN KEY(report) REFERENCES reports(id),
+    FOREIGN KEY(guild) REFERENCES guilds(id)
+);;
+CREATE TABLE IF NOT EXISTS "banned" (
+    "id" INTEGER NOT NULL,
+    "is_user" INTEGER NOT NULL
+)
+"""
 
 
 class BlackListContext(commands.Context):
+    INFO = 0
+    ERROR = 1
+    OK = 2
+
     def __init__(self, **kwargs):
         super(BlackListContext, self).__init__(**kwargs)
 
@@ -39,6 +78,73 @@ class BlackListContext(commands.Context):
             color=color
         ))
 
+    async def get_color(self, typ: int):
+        return [discord.Colour.blue(), discord.Colour.red(), discord.Colour.green()][typ]
+
+    # noinspection PyDefaultArgument
+    async def embed(self, *,
+                    author: str = None,
+                    description: str = None,
+                    title: str = None,
+                    title_url: str = None,
+                    typ: int = INFO,
+                    fields: List[Tuple[str, str]] = None,
+                    thumbnail: str = None,
+                    clr: discord.Colour = None,
+                    image: Union[str, io.BufferedIOBase] = None,
+                    footer: str = None,
+                    not_inline: List[int] = [],
+                    trash_reaction: bool = False):
+        if typ and clr:
+            raise ValueError("typ and clr can not be both defined")
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            colour=(await self.get_color(typ) if not clr else clr),
+            title_url=title_url
+        )
+        if author:
+            embed.set_author(name=author)
+        if image:
+            if isinstance(image, str):
+                embed.set_image(url=image)
+                f = None
+            else:
+                image.seek(0)
+                f = discord.File(image, filename="image.png")
+                embed.set_image(url="attachment://image.png")
+        else:
+            f = None
+        if footer:
+            embed.set_footer(text=footer)
+        if thumbnail:
+            embed.set_thumbnail(url=thumbnail)
+        for n, r in enumerate(fields or []):
+            embed.add_field(name=r[0], value=r[1] or "None", inline=n not in not_inline)
+        msg = await self.send(embed=embed, file=f)
+        if trash_reaction:
+            await self.trash_reaction(msg)
+
+    async def trash_reaction(self, message: discord.Message):
+        if len(message.embeds) == 0:
+            return
+
+        def check(_reaction: discord.Reaction, _user: Union[discord.User, discord.Member]):
+            return all([
+                _user.id == self.author.id or _user.guild_permissions.manage_messages,
+                _reaction.message.id == message.id,
+                str(_reaction) == "🗑️"
+            ])
+
+        await message.add_reaction("🗑️")
+        await asyncio.sleep(0.5)
+        try:
+            _, _ = await self.bot.wait_for("reaction_add", timeout=60.0, check=check)
+        except asyncio.TimeoutError:
+            await message.clear_reactions()
+        else:
+            await message.delete()
+
 
 class BlackListBot(commands.Bot):
 
@@ -50,6 +156,7 @@ class BlackListBot(commands.Bot):
         self.start_time = datetime.now()
         self.cog_groups = {}
         self.db = Database()
+        self.ksoft: Optional[ksoftapi.Client] = None
 
         #  self.version = "+".join(subprocess.check_output(["git", "describe", "--tags"]).
         #                        strip().decode("utf-8").split("-")[:-1])
@@ -76,7 +183,11 @@ class BlackListBot(commands.Bot):
         """
         bot = kwargs.pop('bot', True)
         reconnect = kwargs.pop('reconnect', True)
-        # TODO add database file
+        await self.db.load()
+
+        logging.info("bot:Loading KSoft Client")
+        self.ksoft = ksoftapi.Client(os.getenv("KSOFT"))
+        logging.info("bot:Loaded KSoft Client")
 
         if kwargs:
             raise TypeError("unexpected keyword argument(s) %s" % list(kwargs.keys()))
@@ -121,6 +232,23 @@ class BlackListBot(commands.Bot):
             self.cog_groups[group].append(cog)
 
 
+@dataclass(frozen=True)
+class Report:
+    id: int
+    reporter: int
+    guild: int
+    reported: int
+    reason: str
+    images: str
+
+
 class Database:
     def __init__(self):
-        self.db = aiosqlite.connect("database.db")
+        self.db: Optional[Connection] = None
+        self.randomness = string.ascii_letters + string.digits
+
+    async def load(self):
+        self.db = await aiosqlite.connect("database.db")
+        for i in SQL_STRING.split(";;"):
+            await self.db.execute(i)
+        await self.db.commit()
